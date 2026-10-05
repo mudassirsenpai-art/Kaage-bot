@@ -2,18 +2,17 @@
 """
 Yomi Kaggle Manager Bot
 =======================
-/admin  ->  Accounts | Ipynb | Operate | GPU | Usage
+/admin  ->  Accounts | Ipynb | Operate | Usage
 
 - Accounts : Kaggle account add / delete (bot se token bhejo)
 - Ipynb    : ipynb file add / remove (multiple). Variables ipynb ke andar hi set hote hain.
 - Operate  : Start Bot / Stop Bot  (ipynb Kaggle accounts pe auto chalta hai, account khatam -> agla)
-- GPU      : har ipynb ke liye GPU badlo (T4 / T4 Highmem / P100 / CPU only)
 - Usage    : har account ke weekly GPU hours + kaun kya chala raha hai
 
 ENV (sirf manager bot ke):
   API_ID, API_HASH, BOT_TOKEN, OWNER_ID
   optional: ADMINS="id1,id2"  DATA_DIR=data  PORT  GPU_WEEKLY_HOURS=30  MAX_RUN_HOURS=11.5
-            POLL_SECONDS=60  COOLDOWN_HOURS=6  GAP_SECONDS=20  DEFAULT_GPU=t4 (t4|t4h|p100|cpu)
+            POLL_SECONDS=60  COOLDOWN_HOURS=6  GAP_SECONDS=20  ENABLE_GPU=1
 """
 import os, re, sys, json, time, html, shutil, random, string, asyncio, tempfile, subprocess, threading
 import http.server
@@ -43,14 +42,7 @@ MAX_RUN_H = float(os.environ.get("MAX_RUN_HOURS", "11.5"))
 QUICK_FAIL_S = int(os.environ.get("QUICK_FAIL_SECONDS", "600"))
 COOLDOWN_H = float(os.environ.get("COOLDOWN_HOURS", "6"))
 GAP_S = int(os.environ.get("GAP_SECONDS", "20"))
-# GPU choices (menu me 🎮 GPU se badalte hain). Kaggle ka default P100 hota hai, isliye T4 explicitly set hota hai.
-GPU_CHOICES = {
-    "t4": ("NvidiaTeslaT4", "T4"),
-    "t4h": ("NvidiaTeslaT4Highmem", "T4 Highmem"),
-    "p100": ("NvidiaTeslaP100", "P100"),
-    "cpu": (None, "CPU only"),
-}
-DEFAULT_GPU = os.environ.get("DEFAULT_GPU", "t4") if os.environ.get("DEFAULT_GPU", "t4") in GPU_CHOICES else "t4"
+ENABLE_GPU = os.environ.get("ENABLE_GPU", "1") != "0"
 PREFIX = "mgr-"                      # sab kernels is prefix se bante hain (cleanup ke liye)
 
 # ============================== state
@@ -95,7 +87,7 @@ def log(*a):
 
 
 # ============================== kaggle helpers (blocking - to_thread me chalao)
-def kaggle(acc, args, timeout=120, stdin=None):
+def kaggle(acc, args, timeout=120, stdin=None, cmd=None):
     cfg = Path(tempfile.gettempdir()) / f"kcfg_{acc['id']}"
     cfg.mkdir(parents=True, exist_ok=True)
     creds = cfg / "kaggle.json"
@@ -109,7 +101,7 @@ def kaggle(acc, args, timeout=120, stdin=None):
     if acc["key"].startswith("KGAT_"):                 # naya token format
         env["KAGGLE_API_TOKEN"] = acc["key"]
         (cfg / "access_token").write_text(acc["key"])
-    return subprocess.run(["kaggle", *args], env=env, capture_output=True, text=True, timeout=timeout, input=stdin)
+    return subprocess.run(cmd or ["kaggle", *args], env=env, capture_output=True, text=True, timeout=timeout, input=stdin)
 
 
 def validate_account(acc):
@@ -135,6 +127,60 @@ def delete_kernel(acc, slug):
         return False
 
 
+CANCEL_PY = r"""
+import sys
+from kaggle.api.kaggle_api_extended import KaggleApi
+api = KaggleApi(); api.authenticate()
+user, slug = sys.argv[1], sys.argv[2]
+done = False
+try:
+    from kagglesdk.kernels.types import kernels_api_service as svc
+    with api.build_kaggle_client() as k:
+        cl = k.kernels.kernels_api_client
+        fn = getattr(cl, "cancel_kernel_session", None)
+        Req = getattr(svc, "ApiCancelKernelSessionRequest", None)
+        if fn and Req:
+            r = Req(); r.user_name = user; r.kernel_slug = slug
+            fn(r); done = True
+except Exception as e:
+    print("sdk cancel err:", repr(e))
+print("CANCEL_OK" if done else "CANCEL_NA")
+"""
+
+
+def cancel_kernel(acc, slug):
+    """Running session ko rokne ki koshish (delete akela session band nahi karta)."""
+    for args in (["kernels", "cancel", f"{acc['user']}/{slug}"], ["kernels", "stop", f"{acc['user']}/{slug}"]):
+        try:
+            if kaggle(acc, args, 60).returncode == 0:
+                return True
+        except Exception:
+            pass
+    try:
+        r = kaggle(acc, None, 90, cmd=[sys.executable, "-c", CANCEL_PY, acc["user"], slug])
+        return "CANCEL_OK" in r.stdout
+    except Exception:
+        return False
+
+
+def kill_kernel(acc, slug, wait=120):
+    """cancel -> delete -> verify. Returns (stopped, last_status)."""
+    t0, st, deleted = time.time(), "unknown", False
+    while time.time() - t0 < wait:
+        st = kernel_status(acc, slug)
+        if st in ("running", "queued", "unknown") and not deleted:
+            cancel_kernel(acc, slug)
+        if not deleted:
+            deleted = delete_kernel(acc, slug)
+        time.sleep(4)
+        st = kernel_status(acc, slug)
+        if st in ("complete", "error", "cancel"):
+            return True, st
+        if st == "unknown" and deleted:
+            return True, "deleted"
+    return False, st
+
+
 def cleanup_leftovers(acc):
     """Manager ke purane (mgr-*) kernels hatao taaki double instance na chale."""
     try:
@@ -144,7 +190,7 @@ def cleanup_leftovers(acc):
         n = 0
         for line in r.stdout.strip().splitlines()[1:]:
             ref = line.split(",")[0].strip()
-            if ref.split("/")[-1].startswith(PREFIX) and delete_kernel(acc, ref.split("/")[-1]):
+            if ref.split("/")[-1].startswith(PREFIX) and kill_kernel(acc, ref.split("/")[-1], 60)[0]:
                 n += 1
         return n
     except Exception:
@@ -184,16 +230,13 @@ def prepare_notebook(nb_id):
 
 
 def push_kernel(acc, nb_id, slug):
-    shape, _label = GPU_CHOICES[nb_gpu(nb_id)]
     wd = Path(tempfile.mkdtemp(prefix="push_"))
     try:
         (wd / "notebook.ipynb").write_text(json.dumps(prepare_notebook(nb_id)), encoding="utf-8")
         meta = {"id": f"{acc['user']}/{slug}", "title": slug, "code_file": "notebook.ipynb",
                 "language": "python", "kernel_type": "notebook", "is_private": True,
-                "enable_gpu": shape is not None, "enable_internet": True,
+                "enable_gpu": ENABLE_GPU, "enable_internet": True,
                 "dataset_sources": [], "competition_sources": [], "kernel_sources": [], "model_sources": []}
-        if shape:
-            meta["machine_shape"] = shape
         (wd / "kernel-metadata.json").write_text(json.dumps(meta))
         r = kaggle(acc, ["kernels", "push", "-p", str(wd)], 180)
         return r.returncode == 0, (r.stdout + r.stderr).strip()
@@ -216,31 +259,24 @@ def kernel_status(acc, slug):
     return "unknown"
 
 
-def nb_gpu(nb_id):
-    """Is ipynb ka GPU code (t4/t4h/p100/cpu)."""
-    code = STATE["notebooks"].get(nb_id, {}).get("gpu") or STATE.get("default_gpu") or DEFAULT_GPU
-    return code if code in GPU_CHOICES else DEFAULT_GPU
-
-
 # ============================== usage / account picking
 def used_hours(aid, now=None):
     now = now or time.time()
     week_ago = now - 7 * 86400
     tot = 0.0
-    for s, e, *_ in STATE["accounts"][aid].get("runs", []):
+    for s, e in STATE["accounts"][aid].get("runs", []):
         s = max(s, week_ago)
         if e > s:
             tot += e - s
     return tot / 3600
 
 
-def record_run(aid, start, end, gpu=True):
+def record_run(aid, start, end):
     a = STATE["accounts"].get(aid)
     if not a:
         return
     runs = [r for r in a.get("runs", []) if r[1] > time.time() - 8 * 86400]
-    if gpu:                                   # CPU-only run GPU quota use nahi karta
-        runs.append([start, end])
+    runs.append([start, end])
     a["runs"] = runs
     a["total_runs"] = a.get("total_runs", 0) + 1
     save()
@@ -253,14 +289,14 @@ def set_cooldown(aid, hours=COOLDOWN_H):
         save()
 
 
-def pick_account(gpu=True):
+def pick_account():
     now = time.time()
     ok = []
     for aid, a in STATE["accounts"].items():
         if aid in BUSY or a.get("cooldown_until", 0) > now:
             continue
         h = used_hours(aid, now)
-        if gpu and h >= WEEKLY_LIMIT_H - SAFETY_H:
+        if h >= WEEKLY_LIMIT_H - SAFETY_H:
             continue
         ok.append((h, aid))
     if not ok:
@@ -323,9 +359,7 @@ async def supervise(nb_id):
     told_wait = False
     try:
         while not job["stop"]:
-            gpu_code = nb_gpu(nb_id)
-            needs_gpu = GPU_CHOICES[gpu_code][0] is not None
-            aid = pick_account(needs_gpu)
+            aid = pick_account()
             if not aid:
                 job["status"] = "waiting"
                 if not told_wait:
@@ -337,8 +371,8 @@ async def supervise(nb_id):
             acc = dict(STATE["accounts"][aid], id=aid)
             slug = f"{PREFIX}{nb_id}-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
             BUSY.add(aid)
-            job.update(acc=aid, status="pushing", start=None, abort=False, slug=slug, kstate=None, gpu=gpu_code)
-            start, reason = time.time(), None
+            job.update(acc=aid, status="pushing", start=None, abort=False, slug=slug, kstate=None)
+            start, reason, pushed, kres = time.time(), None, False, None
             try:
                 ok, msg = await asyncio.to_thread(push_kernel, acc, nb_id, slug)
                 if not ok:
@@ -346,15 +380,23 @@ async def supervise(nb_id):
                     await notify(f"❌ <b>{esc(name)}</b>: push fail ({esc(acc['user'])})\n<code>{esc(msg[-300:])}</code>")
                     reason = "push_fail"
                 else:
+                    pushed = True
                     start = time.time()
                     job.update(start=start, status="running")
                     h = used_hours(aid) if aid in STATE["accounts"] else 0
-                    await notify(f"🚀 <b>{esc(name)}</b> start → <code>{esc(acc['user'])}</code> · {GPU_CHOICES[gpu_code][1]} (weekly used {h:.1f}h)")
+                    await notify(f"🚀 <b>{esc(name)}</b> start → <code>{esc(acc['user'])}</code> (weekly used {h:.1f}h)")
                     reason = await monitor(job, acc, slug, start)
                     end = time.time()
-                    record_run(aid, start, end, needs_gpu)
-                    await asyncio.to_thread(delete_kernel, acc, slug)
+                    record_run(aid, start, end)
             finally:
+                if pushed:
+                    job.update(status="stopping")
+                    try:
+                        kres = await asyncio.shield(asyncio.to_thread(kill_kernel, acc, slug))
+                    except BaseException:
+                        kres = None
+                    if kres and not kres[0]:
+                        await notify(f"⚠️ <b>{esc(name)}</b>: kernel <code>{esc(slug)}</code> abhi bhi {esc(kres[1])} dikh raha hai ({esc(acc['user'])}). Kaggle me manually Stop karo.")
                 BUSY.discard(aid)
                 job.update(acc=None, start=None, status="idle")
 
@@ -399,9 +441,9 @@ async def stop_nb(nb_id):
         return False
     job["stop"] = True
     try:
-        await asyncio.wait_for(asyncio.shield(job["task"]), timeout=120)
+        await asyncio.wait_for(asyncio.shield(job["task"]), timeout=400)
     except Exception:
-        job["task"].cancel()
+        pass   # task ko cancel mat karo: kill_kernel background me poora hone do
     return True
 
 
@@ -430,8 +472,7 @@ def back(to="main"):
 def main_kb():
     return IKM([
         [IKB("👤 Accounts", callback_data="m:acc"), IKB("📓 Ipynb", callback_data="m:nb")],
-        [IKB("⚙️ Operate", callback_data="m:op"), IKB("🎮 GPU", callback_data="m:gpu")],
-        [IKB("📊 Usage", callback_data="m:use")],
+        [IKB("⚙️ Operate", callback_data="m:op"), IKB("📊 Usage", callback_data="m:use")],
     ])
 
 
@@ -489,32 +530,16 @@ def op_menu():
     for nid, n in nbs.items():
         j = JOBS.get(nid)
         if not j:
-            lines.append(f"⚪ <b>{esc(n['name'])}</b> — stopped · {GPU_CHOICES[nb_gpu(nid)][1]}")
+            lines.append(f"⚪ <b>{esc(n['name'])}</b> — stopped")
             continue
         who = STATE["accounts"].get(j.get("acc"), {}).get("user")
         if j["status"] == "running" and j.get("start"):
-            lines.append(f"🟢 <b>{esc(n['name'])}</b> — <code>{esc(who or '?')}</code> · {GPU_CHOICES[j.get('gpu') or nb_gpu(nid)][1]} · {(now - j['start']) / 3600:.1f}h")
+            lines.append(f"🟢 <b>{esc(n['name'])}</b> — <code>{esc(who or '?')}</code> · {(now - j['start']) / 3600:.1f}h")
         else:
             lines.append(f"🟡 <b>{esc(n['name'])}</b> — {j['status']}" + (f" · <code>{esc(who)}</code>" if who else ""))
     kb = IKM([[IKB("▶️ Start Bot", callback_data="op:start"), IKB("⏹ Stop Bot", callback_data="op:stop")],
               [IKB("🔄 Refresh", callback_data="m:op")], back()])
     return "\n".join(lines), kb
-
-
-def gpu_menu():
-    nbs = STATE["notebooks"]
-    dflt = STATE.get("default_gpu") or DEFAULT_GPU
-    lines = ["🎮 <b>GPU</b>\n", f"Default (naye ipynb): <b>{GPU_CHOICES[dflt][1]}</b>\n"]
-    if not nbs:
-        lines.append("Abhi koi ipynb nahi.")
-    for nid, n in nbs.items():
-        lines.append(f"• <b>{esc(n['name'])}</b> — {GPU_CHOICES[nb_gpu(nid)][1]}" + (" 🟢" if nid in JOBS else ""))
-    lines.append("\nℹ️ Badlav agle start / account-switch se lagta hai. Abhi chalte bot pe turant lagana ho to Stop → Start karo.")
-    rows = [[IKB(f"🎮 {n['name']} — {GPU_CHOICES[nb_gpu(nid)][1]}", callback_data=f"gpu:n:{nid}")] for nid, n in nbs.items()]
-    if nbs:
-        rows.append([IKB("⚙️ Set for ALL", callback_data="gpu:n:all")])
-    rows.append(back())
-    return "\n".join(lines), IKM(rows)
 
 
 def usage_menu():
@@ -563,8 +588,6 @@ async def cb(_, q):
             t, kb = nb_menu()
         elif page == "op":
             t, kb = op_menu()
-        elif page == "gpu":
-            t, kb = gpu_menu()
         else:
             t, kb = usage_menu()
         await q.answer()
@@ -635,29 +658,6 @@ async def cb(_, q):
                 pass
         await q.answer("Removed ✅")
         t, kb = nb_menu()
-        return await edit(q, t, kb)
-
-    # ---------- gpu
-    if d.startswith("gpu:n:"):
-        nid = d.split(":")[2]
-        title = "ALL ipynb" if nid == "all" else esc(STATE["notebooks"].get(nid, {}).get("name", "?"))
-        rows = [[IKB(("✅ " if nid != "all" and nb_gpu(nid) == code else "") + label, callback_data=f"gpu:s:{nid}:{code}")]
-                for code, (_shape, label) in GPU_CHOICES.items()]
-        rows.append(back("gpu"))
-        return await edit(q, f"🎮 <b>{title}</b> ke liye GPU chuno:", IKM(rows))
-    if d.startswith("gpu:s:"):
-        _, _, nid, code = d.split(":")
-        if code not in GPU_CHOICES:
-            return await q.answer()
-        if nid == "all":
-            STATE["default_gpu"] = code
-            for n in STATE["notebooks"].values():
-                n["gpu"] = code
-        elif nid in STATE["notebooks"]:
-            STATE["notebooks"][nid]["gpu"] = code
-        save()
-        await q.answer(f"GPU: {GPU_CHOICES[code][1]} ✅")
-        t, kb = gpu_menu()
         return await edit(q, t, kb)
 
     # ---------- operate
