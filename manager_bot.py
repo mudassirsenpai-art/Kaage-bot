@@ -111,7 +111,8 @@ def kaggle(acc, args, timeout=120, stdin=None):
     if acc["key"].startswith("KGAT_"):                 # naya token format
         env["KAGGLE_API_TOKEN"] = acc["key"]
         (cfg / "access_token").write_text(acc["key"])
-    return subprocess.run(["kaggle", *args], env=env, capture_output=True, text=True, timeout=timeout, input=stdin)
+    cmd = [sys.executable, "-c", args[1], *args[2:]] if args and args[0] == "__py__" else ["kaggle", *args]
+    return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout, input=stdin)
 
 
 def validate_account(acc):
@@ -126,28 +127,55 @@ def validate_account(acc):
     return False, (r.stderr or r.stdout).strip()[-200:]
 
 
-def delete_kernel(acc, slug, tries=3):
-    """main.py wala logic: `kaggle kernels delete -k user/slug`. Fail ho to retry (-y ke saath bhi).
-    Returns (ok, err). Kernel pehle se nahi hai (404/not found) to bhi ok."""
+PY_DELETE = r"""
+import sys
+ref = sys.argv[1]; user, slug = ref.split("/", 1)
+from kaggle.api.kaggle_api_extended import KaggleApi
+api = KaggleApi(); api.authenticate()
+cands = [n for n in dir(api) if "delete" in n.lower() and "kernel" in n.lower()]
+if not cands:
+    print("SDK me kernel-delete method nahi. delete-wale methods:", [n for n in dir(api) if "delete" in n.lower()]); sys.exit(3)
+fn = getattr(api, cands[0])
+for a in ((ref,), (user, slug), (slug,)):
+    try:
+        fn(*a); print("OK", cands[0]); sys.exit(0)
+    except TypeError:
+        continue
+    except Exception as e:
+        print("ERR", repr(e)); sys.exit(4)
+print("SDK signature mismatch", cands[0]); sys.exit(5)
+"""
+
+
+def delete_kernel(acc, slug, tries=2):
+    """Kernel delete. Kaggle CLI ke alag-alag versions ke liye kai tareeke try hote hain
+    (`kernels delete user/slug --yes` official, purana `-k`, aur python SDK). Returns (ok, err) - err me har try ka jawab.
+    Kernel pehle se nahi hai (404/not found) to bhi ok."""
     ref = f"{acc['user']}/{slug}"
-    err = ""
+    variants = [["kernels", "delete", ref, "--yes"], ["kernels", "delete", ref],      # official docs: kaggle kernels delete owner/slug --yes
+                ["kernels", "delete", "-k", ref, "-y"], ["kernels", "delete", "-k", ref],   # purane CLI versions
+                ["__py__", PY_DELETE, ref]]
+    errs = {}
     for i in range(tries):
-        try:
-            r = kaggle(acc, ["kernels", "delete", "-k", ref], 45, stdin="y\n")
+        for args in variants:
+            label = "sdk" if args[0] == "__py__" else " ".join(a for a in args if a != ref)
+            try:
+                r = kaggle(acc, args, 60, stdin="y\n")
+            except Exception as e:
+                errs[label] = str(e)[-120:]
+                continue
             if r.returncode == 0:
                 return True, ""
-            err = (r.stderr or r.stdout).strip()[-150:]
-            r = kaggle(acc, ["kernels", "delete", "-k", ref, "-y"], 45)
-            if r.returncode == 0:
+            out = (r.stderr or r.stdout).strip()
+            low = out.lower()
+            if "404" in low or "not found" in low or "does not exist" in low:
                 return True, ""
-            err = (r.stderr or r.stdout).strip()[-150:] or err
-        except Exception as e:
-            err = str(e)
-        low = err.lower()
-        if "404" in low or "not found" in low or "does not exist" in low:
-            return True, ""
-        time.sleep(3)
-    return False, err
+            errs[label] = out.splitlines()[-1][-140:] if out else "(no output)"
+            if "unrecognized arguments" in low or "invalid choice" in low or "usage:" in low or args[0] == "__py__":
+                continue                      # ye tareeka is version me nahi, agla try karo
+            break                             # asli error (auth/network)
+        time.sleep(2)
+    return False, " | ".join(f"[{k}] {v}" for k, v in errs.items())
 
 
 def list_mgr_kernels(acc):
@@ -644,6 +672,23 @@ async def kill_cmd(_, m):
     msg = await m.reply_text("🗑️ Saare bots stop aur kernels delete kar raha hoon...")
     res = await kill_all()
     await msg.edit_text(kill_text(*res))
+
+
+@app.on_message(filters.command("kdebug") & filters.private & admin)
+async def kdebug_cmd(_, m):
+    if not STATE["accounts"]:
+        return await m.reply_text("❌ Koi Kaggle account nahi hai.")
+    aid, a = next(iter(STATE["accounts"].items()))
+    acc = dict(a, id=aid)
+    out = []
+    for args in (["--version"], ["kernels", "--help"], ["kernels", "delete", "--help"]):
+        try:
+            r = await asyncio.to_thread(kaggle, acc, args, 60)
+            txt = ((r.stdout or "") + (r.stderr or "")).strip()
+        except Exception as e:
+            txt = str(e)
+        out.append(f"<b>kaggle {' '.join(args)}</b>\n<pre>{esc(txt[-900:])}</pre>")
+    await m.reply_text("\n".join(out))
 
 
 # ============================== callbacks
