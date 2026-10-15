@@ -44,7 +44,8 @@ MAX_RUN_H = float(os.environ.get("MAX_RUN_HOURS", "11.5"))
 QUICK_FAIL_S = int(os.environ.get("QUICK_FAIL_SECONDS", "600"))
 COOLDOWN_H = float(os.environ.get("COOLDOWN_HOURS", "6"))
 GAP_S = int(os.environ.get("GAP_SECONDS", "20"))
-UNKNOWN_MAX = int(os.environ.get("UNKNOWN_MAX_POLLS", "30"))   # itni baar lagatar status na mile tabhi "unreachable" (30 x 60s = ~30 min)
+UNKNOWN_MAX = 0  # unused: status fail pe kabhi give-up nahi
+UNKNOWN_MAX_UNUSED = int(os.environ.get("UNKNOWN_MAX_POLLS", "0"))   # 0 = kabhi give-up nahi (bot tab tak chalta rahega jab tak Kaggle asli "complete/error/cancel" na bole ya MAX_RUN_H na ho)   # itni baar lagatar status na mile tabhi "unreachable" (30 x 60s = ~30 min)
 # GPU choices (menu me 🎮 GPU se badalte hain). Kaggle ka default P100 hota hai, isliye T4 explicitly set hota hai.
 GPU_CHOICES = {
     "t4": ("NvidiaTeslaT4", "T4"),
@@ -281,11 +282,13 @@ def push_kernel(acc, nb_id, slug):
 
 
 def parse_status(out):
-    """Sirf tab status do jab output me asli 'status ...' line ho. API error text (403/timeout) = unknown."""
-    m = re.search(r'status\s+"?([a-z_.]+)', out)
-    if not m:
-        return "unknown"
-    word = m.group(1)
+    """Kaggle CLI ke alag-alag versions ke output handle karta hai. API error text (403/timeout) = unknown."""
+    out = (out or "").lower()
+    m = re.search(r'status\W+(?:kernelworkerstatus\.)?([a-z_]+)', out)
+    word = m.group(1) if m else ""
+    if not word:
+        m = re.search(r'kernelworkerstatus\.([a-z_]+)', out)
+        word = m.group(1) if m else ""
     for key, val in (("complete", "complete"), ("error", "error"), ("cancel", "cancel"),
                      ("running", "running"), ("queued", "queued"), ("new", "queued")):
         if key in word:
@@ -430,13 +433,10 @@ async def monitor(job, acc, slug, start):
             unknown, warned = 0, False
             continue
         if st == "unknown":
+            # Status API fail = bot ko band NAHI manna. Koi error message nahi, bas chup-chap retry.
             unknown += 1
-            if unknown >= 5 and not warned:
-                warned = True
-                await notify(f"⚠️ <b>{esc(STATE['notebooks'].get(job.get('nb'), {}).get('name', 'bot'))}</b>: Kaggle status check fail ho raha hai ({esc(acc['user'])}). "
-                             f"Bot chal raha ho sakta hai - abhi band nahi kar raha, {UNKNOWN_MAX} baar fail hone tak wait.")
-            if unknown >= UNKNOWN_MAX:
-                return "status_unreachable"
+            if unknown in (1, 10, 60):
+                log("status unknown, retrying:", acc["user"], slug, unknown)
             continue
         return st
 
