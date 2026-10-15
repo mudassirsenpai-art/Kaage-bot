@@ -102,19 +102,26 @@ def log(*a):
 
 # ============================== kaggle helpers (blocking - to_thread me chalao)
 def kaggle(acc, args, timeout=120, stdin=None):
+    key = (acc.get("key") or "").strip().strip('"').strip("'")
+    user = (acc.get("user") or "").strip()
     cfg = Path(tempfile.gettempdir()) / f"kcfg_{acc['id']}"
     cfg.mkdir(parents=True, exist_ok=True)
     creds = cfg / "kaggle.json"
-    creds.write_text(json.dumps({"username": acc["user"], "key": acc["key"]}))
+    creds.write_text(json.dumps({"username": user, "key": key}))
     try:
         creds.chmod(0o600)
     except Exception:
         pass
     env = os.environ.copy()
-    env.update(KAGGLE_CONFIG_DIR=str(cfg), KAGGLE_USERNAME=acc["user"], KAGGLE_KEY=acc["key"])
-    if acc["key"].startswith("KGAT_"):                 # naya token format
-        env["KAGGLE_API_TOKEN"] = acc["key"]
-        (cfg / "access_token").write_text(acc["key"])
+    env.update(KAGGLE_CONFIG_DIR=str(cfg), KAGGLE_USERNAME=user, KAGGLE_KEY=key)
+    legacy = bool(re.fullmatch(r"[0-9a-f]{32}", key))      # purani key = 32 hex; baaki sab naya token
+    if not legacy:                                          # naya token format (KGAT_...) - CLI ko token chahiye
+        env["KAGGLE_API_TOKEN"] = key
+        (cfg / "access_token").write_text(key)
+        try:
+            (cfg / "access_token").chmod(0o600)
+        except Exception:
+            pass
     cmd = [sys.executable, "-c", args[1], *args[2:]] if args and args[0] == "__py__" else ["kaggle", *args]
     return subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout, input=stdin)
 
