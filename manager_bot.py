@@ -45,7 +45,7 @@ QUICK_FAIL_S = int(os.environ.get("QUICK_FAIL_SECONDS", "600"))
 COOLDOWN_H = float(os.environ.get("COOLDOWN_HOURS", "6"))
 GAP_S = int(os.environ.get("GAP_SECONDS", "20"))
 UNKNOWN_MAX = 0  # unused: status fail pe kabhi give-up nahi
-UNKNOWN_MAX_UNUSED = int(os.environ.get("UNKNOWN_MAX_POLLS", "0"))   # 0 = kabhi give-up nahi (bot tab tak chalta rahega jab tak Kaggle asli "complete/error/cancel" na bole ya MAX_RUN_H na ho)   # itni baar lagatar status na mile tabhi "unreachable" (30 x 60s = ~30 min)
+UNKNOWN_MAX_UNUSED = int(os.environ.get("UNKNOWN_MAX_POLLS", "0"))   # 0 = kabhi give-up nahi
 # GPU choices (menu me 🎮 GPU se badalte hain). Kaggle ka default P100 hota hai, isliye T4 explicitly set hota hai.
 GPU_CHOICES = {
     "t4": ("NvidiaTeslaT4", "T4"),
@@ -157,7 +157,6 @@ for a in ((ref,), (user, slug), (slug,)):
 print("SDK signature mismatch", cands[0]); sys.exit(5)
 """
 
-
 def kernel_gone(acc, slug):
     """Kaggle pe kernel ab nahi hai? True/False, None = verify nahi ho paya.
     Delete API kabhi 403 deta hai jabki kernel asal me delete ho chuka hota hai (fake error) - isliye list se verify."""
@@ -180,15 +179,17 @@ def delete_kernel(acc, slug, tries=2):
     CLI error (jaise 403) aaye to bhi list se check hota hai - kernel gayab hai to success maana jata hai.
     Returns (ok, err)."""
     ref = f"{acc['user']}/{slug}"
-    variants = [["kernels", "delete", ref, "--yes"], ["kernels", "delete", ref],
-                ["kernels", "delete", "-k", ref, "-y"], ["kernels", "delete", "-k", ref],
+    # main.py wala tareeka sabse pehle: kaggle kernels delete -k <ref>  (jo aapke CLI me chalta hai)
+    variants = [["kernels", "delete", "-k", ref],
+                ["kernels", "delete", ref, "--yes"], ["kernels", "delete", ref],
+                ["kernels", "delete", "-k", ref, "-y"],
                 ["__py__", PY_DELETE, ref]]
     errs = {}
     for i in range(tries):
         for args in variants:
             label = "sdk" if args[0] == "__py__" else " ".join(a for a in args if a != ref)
             try:
-                r = kaggle(acc, args, 60, stdin="y\n")
+                r = kaggle(acc, args, 45, stdin=("y\n" if "-k" not in args or "-y" in args else None))
             except Exception as e:
                 errs[label] = str(e)[-120:]
                 continue
@@ -212,6 +213,11 @@ def delete_kernel(acc, slug, tries=2):
     return False, " | ".join(f"[{k}] {v}" for k, v in errs.items())
 
 
+def stop_then_delete(acc, slug):
+    """main.py jaisa: seedha `kaggle kernels delete -k user/slug` (kernel delete = session band)."""
+    return delete_kernel(acc, slug)
+
+
 def list_mgr_kernels(acc):
     """Account ke saare mgr-* kernels (slug list), err."""
     try:
@@ -233,7 +239,7 @@ def cleanup_leftovers(acc):
     slugs, err = list_mgr_kernels(acc)
     n = 0
     for slug in slugs:
-        if delete_kernel(acc, slug)[0]:
+        if stop_then_delete(acc, slug)[0]:
             n += 1
     return n
 
@@ -472,7 +478,7 @@ async def supervise(nb_id):
             acc = dict(STATE["accounts"][aid], id=aid)
             slug = f"{PREFIX}{nb_id}-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
             BUSY.add(aid)
-            job.update(nb=nb_id, acc=aid, status="pushing", start=None, abort=False, slug=slug, kstate=None, gpu=gpu_code, kernel_live=True)
+            job.update(nb=nb_id, acc=aid, status="pushing", start=None, abort=False, slug=slug, kstate=None, gpu=gpu_code, kernel_live=True, killed=None)
             start, reason = time.time(), None
             try:
                 ok, msg = await asyncio.to_thread(push_kernel, acc, nb_id, slug)
@@ -491,11 +497,15 @@ async def supervise(nb_id):
                         reason = await monitor(job, acc, slug, start)
                     record_run(aid, start, time.time(), needs_gpu)
             finally:
-                # Kernel HAMESHA delete hoga (stop / cancel / error / max-run, sab me) - main.py wala delete logic
+                # HAMESHA: pehle session stop, phir kernel delete (stop / error / max-run, sab me).
+                # stop_nb pehle hi kill kar chuka ho to dobara nahi.
                 job["status"] = "stopping"
-                dok, derr = await asyncio.to_thread(delete_kernel, acc, slug)
+                if job.get("killed") == slug:
+                    dok, derr = True, ""
+                else:
+                    dok, derr = await asyncio.to_thread(stop_then_delete, acc, slug)
                 if not dok:
-                    await notify(f"⚠️ <b>{esc(name)}</b>: kernel delete fail <code>{esc(acc['user'])}/{esc(slug)}</code>\n<code>{esc(derr)}</code>\nKaggle me manually delete karo ya /kill chalao." + ("\n(403 = token ko delete permission nahi lagti; kernel list me abhi bhi dikh raha hai)" if "403" in derr else ""))
+                    await notify(f"⚠️ <b>{esc(name)}</b>: kernel stop/delete fail <code>{esc(acc['user'])}/{esc(slug)}</code>\n<code>{esc(derr)}</code>\nKaggle me manually delete karo ya /kill chalao." + ("\n(403 = token ko delete permission nahi lagti; kernel list me abhi bhi dikh raha hai)" if "403" in derr else ""))
                 BUSY.discard(aid)
                 job.update(acc=None, start=None, status="idle", kernel_live=False)
 
@@ -512,7 +522,7 @@ async def supervise(nb_id):
                 continue
 
             mins = (time.time() - start) / 60
-            # cooldown sirf asli kernel failure pe (error/cancel/complete jaldi). status_unreachable/stopped/max_run pe NAHI.
+            # cooldown sirf asli kernel failure pe (error/cancel/complete jaldi). stopped/max_run pe NAHI.
             quick = reason in ("error", "cancel", "complete") and (time.time() - start) < QUICK_FAIL_S
             if quick:
                 set_cooldown(aid)
@@ -556,20 +566,27 @@ async def stop_nb(nb_id):
     if not job:
         return False
     job["stop"] = True
-    # Turant kernel delete (supervisor ka wait nahi) - main.py ke Cancel/kill jaisa
-    if job.get("status") == "running" and job.get("acc") in STATE["accounts"] and job.get("slug"):
-        acc = dict(STATE["accounts"][job["acc"]], id=job["acc"])
-        await asyncio.to_thread(delete_kernel, acc, job["slug"])
+    acc_id, slug = job.get("acc"), job.get("slug")
+    # Turant: pehle session stop, phir kernel delete (supervisor ka wait nahi)
+    if acc_id in STATE["accounts"] and slug and job.get("status") in ("running", "stopping"):
+        acc = dict(STATE["accounts"][acc_id], id=acc_id)
+        ok, _ = await asyncio.to_thread(stop_then_delete, acc, slug)
+        if ok:
+            job["killed"] = slug                   # supervisor ke finally me dobara nahi karna
     try:
         await asyncio.wait_for(asyncio.shield(job["task"]), timeout=240)
     except Exception:
         job["task"].cancel()
-        await asyncio.gather(job["task"], return_exceptions=True)   # finally me kernel delete poora ho
+        await asyncio.gather(job["task"], return_exceptions=True)
+        # push thread cancel ke baad bhi kernel bana sakta hai -> last cleanup
+        if acc_id in STATE["accounts"] and slug and job.get("killed") != slug:
+            acc = dict(STATE["accounts"][acc_id], id=acc_id)
+            await asyncio.to_thread(stop_then_delete, acc, slug)
     return True
 
 
 async def kill_all():
-    """main.py ke /kill jaisa: sab bots stop + sab accounts ke mgr-* kernels delete."""
+    """main.py ke /kill jaisa: sab bots stop + sab accounts ke mgr-* kernels stop+delete."""
     ids = list(JOBS)
     await asyncio.gather(*(stop_nb(n) for n in ids))
     deleted, errors = [], []
@@ -580,7 +597,7 @@ async def kill_all():
             errors.append(err)
             continue
         for slug in slugs:
-            ok, derr = await asyncio.to_thread(delete_kernel, acc, slug)
+            ok, derr = await asyncio.to_thread(stop_then_delete, acc, slug)
             if ok:
                 deleted.append(f"{a['user']}/{slug}")
             else:
@@ -840,7 +857,7 @@ async def cb(_, q):
             for j in JOBS.values():
                 if j.get("acc") == aid:
                     j["abort"] = True
-            for _ in range(20):
+            for _ in range(120):               # stop+delete ab thoda time leta hai
                 if aid not in BUSY:
                     break
                 await asyncio.sleep(1)
@@ -977,7 +994,7 @@ async def cb(_, q):
         return await edit(q, "⏹ Kaunsa bot stop karna hai?", IKM(rows))
     if d.startswith("op:xs:") or d == "op:xa":
         ids = [d.split(":")[2]] if d.startswith("op:xs:") else list(JOBS)
-        await q.answer("Stop ho raha hai... (kernel delete hone me thoda time lagta hai)")
+        await q.answer("Stop ho raha hai... (session stop + delete me 1-2 min lag sakte hain)")
         await edit(q, "⏹ Stopping...", None)
         await asyncio.gather(*(stop_nb(n) for n in ids))
         t, kb = op_menu()
